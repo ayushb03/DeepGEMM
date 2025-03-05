@@ -64,13 +64,13 @@ def run_benchmarks_worker(
     num_runs: int = 10,
 ):
     """
-    Worker function to run benchmarks across multiple GPUs.
+    Worker function for running benchmarks on a single process.
     
     Args:
-        rank: Current process rank
+        rank: Process rank
         world_size: Total number of processes
         port: Port for distributed communication
-        matrix_sizes: List of matrix dimensions to benchmark (m, n, k)
+        matrix_sizes: List of (M, N, K) matrix sizes to benchmark
         strategies: List of sharding strategies to benchmark
         num_warmups: Number of warmup iterations
         num_runs: Number of benchmark iterations
@@ -78,63 +78,82 @@ def run_benchmarks_worker(
     # Initialize distributed environment
     setup_distributed(rank, world_size, port)
     
-    # Skip if CUDA is not available
-    if not torch.cuda.is_available() and rank == 0:
+    # Check if CUDA is available
+    if not torch.cuda.is_available():
+        print(f"Rank {rank}/{world_size} initialized")
         print("CUDA is not available, skipping benchmark")
         cleanup()
         return
     
-    # Store benchmark results
+    # Set device
+    torch.cuda.set_device(rank)
+    
+    # Results storage
     fp16_results = {}
     bf16_results = {}
     
-    # Benchmark each matrix size and strategy
+    # Only rank 0 prints progress
+    if rank == 0:
+        print(f"Running benchmarks on {world_size} GPUs")
+        print(f"Matrix sizes: {matrix_sizes}")
+        print(f"Strategies: {strategies}")
+        print(f"Warmup iterations: {num_warmups}")
+        print(f"Benchmark iterations: {num_runs}")
+    
+    # Run benchmarks for each strategy
     for strategy in strategies:
-        strategy_name = strategy.value
+        strategy_name = str(strategy).split('.')[-1]
+        
+        if rank == 0:
+            print(f"\nBenchmarking strategy: {strategy_name}")
+        
         fp16_results[strategy_name] = []
         bf16_results[strategy_name] = []
         
+        # Run benchmarks for each matrix size
         for m, n, k in matrix_sizes:
-            # Benchmark FP16
             if rank == 0:
-                print(f"Benchmarking FP16 GEMM with size {m}x{n}x{k}, strategy: {strategy_name}")
+                print(f"  Matrix size: {m}x{n}x{k}")
             
-            fp16_time = benchmark_distributed_gemm(
-                m=m, n=n, k=k,
-                dtype=torch.float16,
-                num_warmups=num_warmups,
-                num_runs=num_runs,
-                strategy=strategy
-            )
+            # FP16 benchmark
+            try:
+                fp16_time = benchmark_distributed_gemm(
+                    m, n, k, 
+                    strategy=strategy,
+                    dtype=torch.float16,
+                    num_warmups=num_warmups,
+                    num_runs=num_runs
+                )
+                
+                if rank == 0:
+                    print(f"    FP16: {fp16_time:.2f} ms")
+                    fp16_results[strategy_name].append((m, n, k, fp16_time))
+            except Exception as e:
+                if rank == 0:
+                    print(f"    FP16 benchmark failed: {e}")
             
-            # Benchmark BF16
-            if rank == 0:
-                print(f"Benchmarking BF16 GEMM with size {m}x{n}x{k}, strategy: {strategy_name}")
-            
-            bf16_time = benchmark_distributed_gemm(
-                m=m, n=n, k=k,
-                dtype=torch.bfloat16,
-                num_warmups=num_warmups,
-                num_runs=num_runs,
-                strategy=strategy
-            )
-            
-            # Store results (only on rank 0)
-            if rank == 0:
-                fp16_results[strategy_name].append((m, n, k, fp16_time))
-                bf16_results[strategy_name].append((m, n, k, bf16_time))
+            # BF16 benchmark
+            try:
+                bf16_time = benchmark_distributed_gemm(
+                    m, n, k, 
+                    strategy=strategy,
+                    dtype=torch.bfloat16,
+                    num_warmups=num_warmups,
+                    num_runs=num_runs
+                )
+                
+                if rank == 0:
+                    print(f"    BF16: {bf16_time:.2f} ms")
+                    bf16_results[strategy_name].append((m, n, k, bf16_time))
+            except Exception as e:
+                if rank == 0:
+                    print(f"    BF16 benchmark failed: {e}")
     
-    # Plot results on rank 0
+    # Plot results (only on rank 0)
     if rank == 0:
-        plot_results(
-            fp16_results=fp16_results,
-            bf16_results=bf16_results,
-            world_size=world_size,
-            matrix_sizes=matrix_sizes,
-            strategies=strategies
-        )
+        plot_results(fp16_results, bf16_results, world_size, matrix_sizes, strategies)
     
-    # Cleanup distributed environment
+    # Clean up
     cleanup()
 
 
@@ -210,55 +229,65 @@ def run_benchmarks(
     num_runs: int = 10,
 ):
     """
-    Launch benchmark processes across multiple GPUs.
+    Run benchmarks for distributed GEMM operations.
     
     Args:
-        world_size: Number of processes to spawn
+        world_size: Number of processes to use
         port: Port for distributed communication
-        matrix_sizes: List of matrix dimensions to benchmark (m, n, k)
+        matrix_sizes: List of (M, N, K) matrix sizes to benchmark
         strategies: List of sharding strategies to benchmark
         num_warmups: Number of warmup iterations
         num_runs: Number of benchmark iterations
     """
+    # Check if CUDA is available
+    if not torch.cuda.is_available():
+        print("CUDA is not available. Distributed benchmarks require CUDA.")
+        print("Skipping distributed benchmarks.")
+        return
+        
+    print(f"Starting benchmark with {world_size} processes")
+    
     # Default matrix sizes if not provided
     if matrix_sizes is None:
         matrix_sizes = [
             (1024, 1024, 1024),
             (2048, 2048, 2048),
             (4096, 4096, 4096),
-            (8192, 4096, 1024),
-            (16384, 2048, 1024)
+            (8192, 8192, 8192)
         ]
     
     # Default strategies if not provided
     if strategies is None:
         strategies = [
             ShardingStrategy.ROW_PARALLEL,
-            ShardingStrategy.COLUMN_PARALLEL,
-            ShardingStrategy.FULLY_SHARDED
+            ShardingStrategy.COLUMN_PARALLEL
         ]
-    else:
-        # Convert strategy strings to ShardingStrategy enum values
-        strategy_map = {
-            'row': ShardingStrategy.ROW_PARALLEL,
-            'column': ShardingStrategy.COLUMN_PARALLEL,
-            'fully_sharded': ShardingStrategy.FULLY_SHARDED
-        }
-        strategies = [strategy_map[s] for s in strategies]
+        
+        # Only add FULLY_SHARDED if world_size is a perfect square
+        if (int(world_size ** 0.5) ** 2) == world_size and world_size > 1:
+            strategies.append(ShardingStrategy.FULLY_SHARDED)
     
-    # Check if we have enough GPUs
-    if torch.cuda.is_available():
-        available_gpus = torch.cuda.device_count()
-        if available_gpus < world_size:
-            print(f"Warning: Requested {world_size} GPUs but only {available_gpus} are available")
-            world_size = available_gpus
+    # Convert string strategies to enum
+    strategy_map = {
+        "row": ShardingStrategy.ROW_PARALLEL,
+        "column": ShardingStrategy.COLUMN_PARALLEL,
+        "fully_sharded": ShardingStrategy.FULLY_SHARDED
+    }
     
-    print(f"Starting benchmark with {world_size} processes")
+    strategies_enum = []
+    for strategy in strategies:
+        if isinstance(strategy, str):
+            if strategy.lower() in strategy_map:
+                strategies_enum.append(strategy_map[strategy.lower()])
+            else:
+                print(f"Warning: Unknown strategy '{strategy}', skipping")
+        else:
+            strategies_enum.append(strategy)
     
-    # Spawn processes
+    # Start processes
     mp.spawn(
         run_benchmarks_worker,
-        args=(world_size, port, matrix_sizes, strategies, num_warmups, num_runs),
+        args=(world_size, port, matrix_sizes, strategies_enum, num_warmups, num_runs),
         nprocs=world_size,
         join=True
     )

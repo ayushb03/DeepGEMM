@@ -1,0 +1,45 @@
+# Default distributed GEMM configuration
+
+# Distributed setup
+distributed:
+  # Sharding strategy: row, column, or fully_sharded
+  strategy: "row"
+  
+  # Communication backend: nccl (for GPU) or gloo (for CPU)
+  backend: "nccl"
+  
+  # Master node information
+  master_addr: "localhost"
+  master_port: 12355
+  
+  # Device settings
+  device_type: "cuda"
+  timeout_seconds: 1800
+  
+# Performance settings
+performance:
+  # Whether to perform automatic mixed precision computation
+  use_amp: true
+  
+  # Whether to use tensor cores
+  use_tensor_cores: true
+  
+  # Default number of warmup iterations for benchmarks
+  benchmark_warmups: 5
+  
+  # Default number of iterations for benchmarks
+  benchmark_iterations: 10
+
+# Logging settings
+logging:
+  # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  level: "INFO"
+  
+  # Whether to log distributed initialization details
+  log_init_details: true
+  
+  # Whether to log tensor shapes during operations
+  log_tensor_shapes: false
+  
+  # Whether to log performance metrics
+  log_performance: true 

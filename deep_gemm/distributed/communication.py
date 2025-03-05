@@ -1,281 +1,492 @@
 """
-Optimized communication primitives for distributed GEMM operations.
+Distributed communication primitives for DeepGEMM.
 
-This module provides efficient communication operations for transferring
-matrix data between multiple GPUs during distributed GEMM computation.
+This module provides efficient communication operations for distributed GEMM,
+with robust error handling and validation checks.
 """
 
-import math
-from typing import List, Optional, Tuple, Union
+import logging
+import os
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
 
-from .multi_gpu import get_rank, get_world_size
+# Configure logging
+logger = logging.getLogger("deep_gemm.distributed.comm")
+
+
+class DistributedError(Exception):
+    """Base exception for distributed communication errors."""
+    pass
+
+
+class ProcessGroupError(DistributedError):
+    """Exception raised for process group errors."""
+    pass
+
+
+class CommunicationError(DistributedError):
+    """Exception raised for communication operation errors."""
+    pass
+
+
+class DeviceMismatchError(DistributedError):
+    """Exception raised when tensors are not on the expected device."""
+    pass
+
+
+class ShapeMismatchError(DistributedError):
+    """Exception raised when tensor shapes don't match expected dimensions."""
+    pass
+
+
+def initialize_process_group(
+    backend: str = "nccl",
+    init_method: Optional[str] = None,
+    timeout: float = 1800.0,
+    world_size: Optional[int] = None,
+    rank: Optional[int] = None
+) -> None:
+    """
+    Initialize the process group for distributed operations with robust error handling.
+    
+    Args:
+        backend: The backend to use (nccl, gloo, etc.)
+        init_method: The URL to use for initialization
+        timeout: Timeout in seconds for operations
+        world_size: Number of processes participating
+        rank: Rank of this process
+        
+    Raises:
+        ProcessGroupError: If initialization fails
+    """
+    # Use environment variables if parameters are not provided
+    if world_size is None:
+        world_size_env = os.environ.get("WORLD_SIZE")
+        if world_size_env is None:
+            raise ProcessGroupError(
+                "world_size not provided and WORLD_SIZE environment variable not set"
+            )
+        world_size = int(world_size_env)
+    
+    if rank is None:
+        rank_env = os.environ.get("RANK")
+        if rank_env is None:
+            raise ProcessGroupError(
+                "rank not provided and RANK environment variable not set"
+            )
+        rank = int(rank_env)
+    
+    # Default initialization method
+    if init_method is None:
+        # Use environment variables if available
+        master_addr = os.environ.get("MASTER_ADDR", "localhost")
+        master_port = os.environ.get("MASTER_PORT", "12355")
+        init_method = f"tcp://{master_addr}:{master_port}"
+    
+    try:
+        # Check if already initialized
+        if dist.is_initialized():
+            logger.warning("Process group already initialized, skipping initialization")
+            return
+        
+        # Initialize process group
+        dist.init_process_group(
+            backend=backend,
+            init_method=init_method,
+            world_size=world_size,
+            rank=rank,
+            timeout=datetime.timedelta(seconds=timeout)
+        )
+        
+        logger.info(
+            f"Initialized process group: backend={backend}, "
+            f"world_size={world_size}, rank={rank}"
+        )
+    except (RuntimeError, ValueError) as e:
+        raise ProcessGroupError(f"Failed to initialize process group: {e}") from e
+
+
+def cleanup_process_group() -> None:
+    """
+    Clean up the process group for distributed operations.
+    
+    Raises:
+        ProcessGroupError: If cleanup fails
+    """
+    try:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+            logger.info("Process group cleaned up")
+        else:
+            logger.warning("Process group not initialized, skipping cleanup")
+    except RuntimeError as e:
+        raise ProcessGroupError(f"Failed to clean up process group: {e}") from e
+
+
+def get_process_group(
+    ranks: Optional[List[int]] = None,
+    timeout: float = 1800.0
+) -> Any:
+    """
+    Get a process group for collective operations.
+    
+    Args:
+        ranks: List of ranks to include in the process group (None for all)
+        timeout: Timeout in seconds for operations
+        
+    Returns:
+        Process group for collective operations
+        
+    Raises:
+        ProcessGroupError: If getting process group fails
+    """
+    try:
+        if not dist.is_initialized():
+            raise ProcessGroupError("Process group not initialized")
+        
+        if ranks is None:
+            return dist.group.WORLD
+        
+        return dist.new_group(
+            ranks=ranks,
+            timeout=datetime.timedelta(seconds=timeout)
+        )
+    except RuntimeError as e:
+        raise ProcessGroupError(f"Failed to get process group: {e}") from e
+
+
+def validate_tensor(
+    tensor: torch.Tensor,
+    expected_ndim: Optional[int] = None,
+    expected_dtype: Optional[torch.dtype] = None,
+    expected_device_type: Optional[str] = None,
+    name: str = "tensor"
+) -> None:
+    """
+    Validate tensor properties.
+    
+    Args:
+        tensor: Tensor to validate
+        expected_ndim: Expected number of dimensions
+        expected_dtype: Expected data type
+        expected_device_type: Expected device type (cuda, cpu)
+        name: Name of the tensor for error messages
+        
+    Raises:
+        ValueError: If tensor is invalid
+        ShapeMismatchError: If tensor doesn't have expected dimensions
+        DeviceMismatchError: If tensor is not on expected device
+    """
+    if not isinstance(tensor, torch.Tensor):
+        raise ValueError(f"{name} must be a torch.Tensor")
+    
+    if expected_ndim is not None and tensor.ndim != expected_ndim:
+        raise ShapeMismatchError(
+            f"{name} must have {expected_ndim} dimensions, got {tensor.ndim}"
+        )
+    
+    if expected_dtype is not None and tensor.dtype != expected_dtype:
+        logger.warning(
+            f"{name} expected dtype {expected_dtype}, got {tensor.dtype}. "
+            "This may affect performance or accuracy."
+        )
+    
+    if expected_device_type is not None:
+        device_type = tensor.device.type
+        if device_type != expected_device_type:
+            raise DeviceMismatchError(
+                f"{name} must be on {expected_device_type} device, got {device_type}"
+            )
 
 
 def all_gather_matrix(
     local_matrix: torch.Tensor,
-    dim: int = 0
+    dim: int = 0,
+    group: Optional[Any] = None
 ) -> torch.Tensor:
     """
     Gather matrices from all processes and concatenate them along the specified dimension.
     
     Args:
-        local_matrix: Local matrix tensor on the current process
-        dim: Dimension along which to concatenate tensors (0 for row-wise, 1 for column-wise)
-    
+        local_matrix: Local matrix from this process
+        dim: Dimension to concatenate along
+        group: Process group
+        
     Returns:
-        Concatenated tensor containing matrices from all processes
+        Gathered matrix
+        
+    Raises:
+        CommunicationError: If all_gather operation fails
+        ShapeMismatchError: If tensor doesn't have expected dimensions
+        DeviceMismatchError: If tensor is not on expected device
     """
-    world_size = get_world_size()
+    validate_tensor(
+        local_matrix,
+        expected_ndim=2,
+        expected_device_type="cuda",
+        name="local_matrix"
+    )
     
-    # If only one process, just return the input
+    if not dist.is_initialized():
+        logger.warning("Process group not initialized, returning local matrix")
+        return local_matrix
+    
+    world_size = dist.get_world_size(group)
+    
+    # Skip if only one process
     if world_size == 1:
         return local_matrix
     
-    # Ensure the tensor is contiguous
-    local_matrix = local_matrix.contiguous()
-    
-    # Get the list of tensors from all ranks
-    gather_list = [torch.zeros_like(local_matrix) for _ in range(world_size)]
-    
-    # All-gather operation
-    dist.all_gather(gather_list, local_matrix)
-    
-    # Concatenate the gathered tensors
-    return torch.cat(gather_list, dim=dim)
+    try:
+        # Get tensor shape and device
+        local_shape = local_matrix.shape
+        device = local_matrix.device
+        
+        # Create list to store output tensors
+        output_tensors = [torch.zeros_like(local_matrix) for _ in range(world_size)]
+        
+        # Perform all_gather
+        dist.all_gather(output_tensors, local_matrix, group=group)
+        
+        # Concatenate tensors
+        gathered_matrix = torch.cat(output_tensors, dim=dim)
+        
+        return gathered_matrix
+    except (RuntimeError, ValueError) as e:
+        raise CommunicationError(f"Failed to all_gather matrix: {e}") from e
 
 
 def reduce_scatter_matrix(
-    full_matrix: torch.Tensor,
+    input_matrix: torch.Tensor,
     dim: int = 0,
-    op: dist.ReduceOp = dist.ReduceOp.SUM
+    op: dist.ReduceOp = dist.ReduceOp.SUM,
+    group: Optional[Any] = None
 ) -> torch.Tensor:
     """
-    Perform a reduce-scatter operation on the matrix.
-    
-    Each process contributes a full matrix and receives a shard of the reduced result.
+    Reduce matrices from all processes and scatter chunks to each process.
     
     Args:
-        full_matrix: Full matrix tensor on the current process
-        dim: Dimension along which to split the tensor (0 for row-wise, 1 for column-wise)
-        op: Reduction operation (default: SUM)
-    
+        input_matrix: Input matrix to reduce and scatter
+        dim: Dimension to scatter along
+        op: Reduction operation
+        group: Process group
+        
     Returns:
-        Local shard of the reduced matrix
+        Reduced and scattered matrix
+        
+    Raises:
+        CommunicationError: If reduce_scatter operation fails
+        ShapeMismatchError: If tensor doesn't have expected dimensions
+        DeviceMismatchError: If tensor is not on expected device
     """
-    world_size = get_world_size()
-    rank = get_rank()
+    validate_tensor(
+        input_matrix,
+        expected_ndim=2,
+        expected_device_type="cuda",
+        name="input_matrix"
+    )
     
-    # If only one process, just return the input
+    if not dist.is_initialized():
+        logger.warning("Process group not initialized, returning input matrix")
+        return input_matrix
+    
+    world_size = dist.get_world_size(group)
+    
+    # Skip if only one process
     if world_size == 1:
-        return full_matrix
+        return input_matrix
     
-    # Get the size of the full matrix
-    full_size = full_matrix.size(dim)
-    
-    # Calculate shard size and start/end positions
-    shard_size = math.ceil(full_size / world_size)
-    start_idx = rank * shard_size
-    end_idx = min((rank + 1) * shard_size, full_size)
-    
-    # Handle case where this rank's shard would be empty
-    if start_idx >= full_size:
-        # Return an empty tensor with proper dimensions
-        shape = list(full_matrix.shape)
-        shape[dim] = 0
-        return torch.empty(shape, dtype=full_matrix.dtype, device=full_matrix.device)
-    
-    # Split the tensor into shards
-    shards = list(torch.tensor_split(full_matrix, world_size, dim=dim))
-    
-    # Make sure each shard is the same size by padding if necessary
-    for i in range(len(shards)):
-        shard_shape = list(shards[i].shape)
-        target_shape = list(shards[0].shape)
-        if shard_shape != target_shape:
-            # Create a new tensor with the target shape
-            new_shard = torch.zeros(target_shape, 
-                                  dtype=full_matrix.dtype, 
-                                  device=full_matrix.device)
-            # Copy the data
-            slices = [slice(None)] * len(target_shape)
-            slices[dim] = slice(0, shard_shape[dim])
-            new_shard[slices] = shards[i]
-            shards[i] = new_shard
-    
-    # Perform reduce-scatter operation
-    output = torch.zeros_like(shards[0])
-    dist.reduce_scatter(output, shards, op=op)
-    
-    # If the last rank's shard was padded, trim it to the correct size
-    if rank == world_size - 1 and end_idx - start_idx < shard_size:
-        slices = [slice(None)] * len(output.shape)
-        slices[dim] = slice(0, end_idx - start_idx)
-        output = output[slices]
-    
-    return output
+    try:
+        # Get tensor shape
+        input_shape = input_matrix.shape
+        
+        # Verify tensor can be evenly divided
+        scatter_dim_size = input_shape[dim]
+        if scatter_dim_size % world_size != 0:
+            raise ShapeMismatchError(
+                f"Cannot evenly scatter dimension {dim} of size {scatter_dim_size} "
+                f"across {world_size} processes"
+            )
+        
+        # Calculate output size
+        output_shape = list(input_shape)
+        output_shape[dim] = scatter_dim_size // world_size
+        
+        # Create output tensor
+        output_tensor = torch.empty(output_shape, dtype=input_matrix.dtype, device=input_matrix.device)
+        
+        # Perform reduce-scatter (implemented using scatter and all-reduce since PyTorch doesn't have direct reduce_scatter)
+        input_chunks = torch.chunk(input_matrix, world_size, dim=dim)
+        chunk_size = input_chunks[0].size(dim)
+        
+        # Scatter
+        rank = dist.get_rank(group)
+        local_chunk = input_chunks[rank]
+        
+        # All-reduce the local chunk
+        dist.all_reduce(local_chunk, op=op, group=group)
+        
+        return local_chunk
+    except (RuntimeError, ValueError) as e:
+        raise CommunicationError(f"Failed to reduce_scatter matrix: {e}") from e
 
 
 def broadcast_matrix(
     matrix: torch.Tensor,
-    src: int = 0
+    src: int = 0,
+    group: Optional[Any] = None
 ) -> torch.Tensor:
     """
-    Broadcast a matrix from the source rank to all other ranks.
+    Broadcast matrix from specified source to all processes.
     
     Args:
-        matrix: Matrix tensor to broadcast (only significant on src)
-        src: Source rank for the broadcast
-    
+        matrix: Matrix to broadcast or receive
+        src: Source rank
+        group: Process group
+        
     Returns:
-        Broadcasted matrix tensor on all ranks
+        Broadcasted matrix
+        
+    Raises:
+        CommunicationError: If broadcast operation fails
+        DeviceMismatchError: If tensor is not on expected device
     """
-    # Ensure the tensor is contiguous
-    matrix = matrix.contiguous()
+    validate_tensor(
+        matrix,
+        expected_device_type="cuda",
+        name="matrix"
+    )
     
-    # Broadcast the tensor
-    dist.broadcast(matrix, src=src)
+    if not dist.is_initialized():
+        logger.warning("Process group not initialized, returning input matrix")
+        return matrix
     
-    return matrix
-
-
-def scatter_matrix(
-    matrix: Optional[torch.Tensor] = None,
-    dim: int = 0,
-    src: int = 0
-) -> torch.Tensor:
-    """
-    Scatter a matrix from source rank to all ranks.
+    world_size = dist.get_world_size(group)
     
-    Args:
-        matrix: Full matrix on source rank, None on other ranks
-        dim: Dimension along which to split the tensor
-        src: Source rank for the scatter
-    
-    Returns:
-        Local shard of the matrix
-    """
-    world_size = get_world_size()
-    rank = get_rank()
-    
-    # If only one process, just return the input
+    # Skip if only one process
     if world_size == 1:
         return matrix
     
-    if rank == src:
-        assert matrix is not None, "Source rank must provide a matrix"
-        
-        # Get the size of the full matrix
-        full_size = matrix.size(dim)
-        
-        # Calculate shard size for each rank
-        shard_sizes = []
-        for r in range(world_size):
-            r_start = r * math.ceil(full_size / world_size)
-            r_end = min((r + 1) * math.ceil(full_size / world_size), full_size)
-            shard_sizes.append(r_end - r_start)
-        
-        # Split the tensor into chunks
-        chunks = []
-        start_idx = 0
-        for size in shard_sizes:
-            if size > 0:
-                slices = [slice(None)] * matrix.dim()
-                slices[dim] = slice(start_idx, start_idx + size)
-                chunks.append(matrix[slices].contiguous())
-                start_idx += size
-            else:
-                # Create an empty shard with the right shape
-                shape = list(matrix.shape)
-                shape[dim] = 0
-                chunks.append(torch.empty(shape, dtype=matrix.dtype, device=matrix.device))
-        
-        # Calculate the output shape for this rank
-        my_start = rank * math.ceil(full_size / world_size)
-        my_end = min((rank + 1) * math.ceil(full_size / world_size), full_size)
-        
-        # If this rank would get an empty tensor, create an empty one with the right shape
-        if my_start >= full_size:
-            shape = list(matrix.shape)
-            shape[dim] = 0
-            output = torch.empty(shape, dtype=matrix.dtype, device=matrix.device)
-        else:
-            # Otherwise, initialize the output with the right shape
-            shape = list(matrix.shape)
-            shape[dim] = my_end - my_start
-            output = chunks[rank]
-        
-        # Scatter the chunks to all ranks
-        dist.scatter(output, chunks if rank == src else None, src=src)
-        
-        return output
-    else:
-        # Non-source ranks need to figure out what shape they'll receive
-        # This requires communication since they don't have the original matrix
-        
-        # First, broadcast the matrix shape from source
-        if rank == src:
-            shape_tensor = torch.tensor(matrix.shape, dtype=torch.long, device="cpu")
-        else:
-            shape_tensor = torch.zeros(8, dtype=torch.long, device="cpu")  # Assume max 8D tensor
-        
-        dist.broadcast(shape_tensor, src=src)
-        
-        # Get the actual shape
-        shape = shape_tensor.tolist()
-        while len(shape) > 0 and shape[-1] == 0:
-            shape.pop()
-        
-        # Also broadcast the full size of the dimension we're scattering on
-        if rank == src:
-            full_size_tensor = torch.tensor([matrix.size(dim)], dtype=torch.long, device="cpu")
-        else:
-            full_size_tensor = torch.zeros(1, dtype=torch.long, device="cpu")
-        
-        dist.broadcast(full_size_tensor, src=src)
-        full_size = full_size_tensor.item()
-        
-        # Calculate this rank's shard size
-        my_start = rank * math.ceil(full_size / world_size)
-        my_end = min((rank + 1) * math.ceil(full_size / world_size), full_size)
-        
-        # If this rank would get an empty tensor, create an empty one with the right shape
-        if my_start >= full_size:
-            shape = list(shape)
-            shape[dim] = 0
-            output = torch.empty(shape, dtype=torch.float32, device="cuda" if torch.cuda.is_available() else "cpu")
-        else:
-            # Otherwise, initialize the output with the right shape
-            shape = list(shape)
-            shape[dim] = my_end - my_start
-            output = torch.empty(shape, dtype=torch.float32, device="cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Receive the data from source rank
-        dist.scatter(output, None, src=src)
-        
-        return output
+    try:
+        # Perform broadcast
+        dist.broadcast(matrix, src=src, group=group)
+        return matrix
+    except (RuntimeError, ValueError) as e:
+        raise CommunicationError(f"Failed to broadcast matrix: {e}") from e
 
 
-def allreduce_matrix(
-    matrix: torch.Tensor,
-    op: dist.ReduceOp = dist.ReduceOp.SUM
+def scatter_matrix(
+    scatter_list: Optional[List[torch.Tensor]] = None,
+    src: int = 0,
+    group: Optional[Any] = None
 ) -> torch.Tensor:
     """
-    Perform an all-reduce operation on a matrix.
+    Scatter matrices from source to all processes.
     
     Args:
-        matrix: Local matrix tensor on the current process
-        op: Reduction operation (default: SUM)
-    
+        scatter_list: List of tensors to scatter (only needed on source process)
+        src: Source rank
+        group: Process group
+        
     Returns:
-        Reduced matrix tensor on all processes
+        Scattered matrix for this process
+        
+    Raises:
+        CommunicationError: If scatter operation fails
+        DeviceMismatchError: If tensor is not on expected device
     """
-    # Ensure the tensor is contiguous
-    matrix = matrix.contiguous()
+    if not dist.is_initialized():
+        logger.warning("Process group not initialized, returning first matrix from list")
+        if scatter_list is not None and len(scatter_list) > 0:
+            return scatter_list[0]
+        raise ValueError("scatter_list is empty or None")
     
-    # Perform all-reduce operation
-    dist.all_reduce(matrix, op=op)
+    world_size = dist.get_world_size(group)
+    rank = dist.get_rank(group)
     
-    return matrix 
+    # Skip if only one process
+    if world_size == 1:
+        if scatter_list is not None and len(scatter_list) > 0:
+            return scatter_list[0]
+        raise ValueError("scatter_list is empty or None")
+    
+    try:
+        # If not source, we only need an output tensor
+        if rank != src:
+            if scatter_list is not None:
+                # Use the expected shape if provided
+                output_tensor = torch.zeros_like(scatter_list[0])
+            else:
+                # Wait to receive the tensor shape
+                raise ValueError("Non-source process needs scatter_list with correct shape")
+        else:
+            # Validate input
+            if scatter_list is None or len(scatter_list) != world_size:
+                raise ValueError(f"scatter_list must contain {world_size} tensors")
+            
+            # Validate each tensor
+            for i, tensor in enumerate(scatter_list):
+                validate_tensor(
+                    tensor,
+                    expected_device_type="cuda",
+                    name=f"scatter_list[{i}]"
+                )
+            
+            # Create output tensor
+            output_tensor = torch.zeros_like(scatter_list[rank])
+            
+        # Perform scatter
+        dist.scatter(output_tensor, scatter_list if rank == src else None, src=src, group=group)
+        return output_tensor
+    except (RuntimeError, ValueError) as e:
+        raise CommunicationError(f"Failed to scatter matrix: {e}") from e
+
+
+def all_reduce_matrix(
+    matrix: torch.Tensor,
+    op: dist.ReduceOp = dist.ReduceOp.SUM,
+    group: Optional[Any] = None
+) -> torch.Tensor:
+    """
+    Reduce matrix from all processes and distribute result back to all processes.
+    
+    Args:
+        matrix: Matrix to reduce
+        op: Reduction operation
+        group: Process group
+        
+    Returns:
+        Reduced matrix
+        
+    Raises:
+        CommunicationError: If all_reduce operation fails
+        DeviceMismatchError: If tensor is not on expected device
+    """
+    validate_tensor(
+        matrix,
+        expected_device_type="cuda",
+        name="matrix"
+    )
+    
+    if not dist.is_initialized():
+        logger.warning("Process group not initialized, returning input matrix")
+        return matrix
+    
+    world_size = dist.get_world_size(group)
+    
+    # Skip if only one process
+    if world_size == 1:
+        return matrix
+    
+    try:
+        # Perform all_reduce
+        dist.all_reduce(matrix, op=op, group=group)
+        return matrix
+    except (RuntimeError, ValueError) as e:
+        raise CommunicationError(f"Failed to all_reduce matrix: {e}") from e
+        
+        
+# Additional imports for datetime
+import datetime 
