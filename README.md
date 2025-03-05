@@ -1,4 +1,127 @@
-# DeepGEMM
+# DeepGEMM: Enhanced GEMM Operations for Deep Learning
+
+DeepGEMM is a high-performance library for matrix multiplication (GEMM) operations optimized for deep learning workloads.
+
+## New Features: Distributed Multi-GPU Support
+
+DeepGEMM now supports distributed matrix multiplication across multiple GPUs, enabling efficient scaling for large matrix operations:
+
+- **Row-Parallel Sharding**: Distributes matrix rows across GPUs for improved parallelism
+- **Column-Parallel Sharding**: Distributes matrix columns for balanced workloads
+- **Fully-Sharded Distribution**: Distributes both dimensions for maximum scalability
+
+These distributed operations are particularly valuable for large-scale deep learning models where matrix sizes exceed single-GPU memory capacity or when faster computation is needed.
+
+### Distributed Usage Example
+
+```python
+import torch
+import torch.distributed as dist
+import deep_gemm.distributed as dist_gemm
+
+# Initialize process group (in each process)
+dist_gemm.initialize_process_group(backend="nccl")
+
+# Get current rank and world size
+rank = dist_gemm.get_rank()
+world_size = dist_gemm.get_world_size()
+
+# Create input matrices (same on all ranks for this example)
+a = torch.randn(1024, 1024, dtype=torch.float16, device=f"cuda:{rank}")
+b = torch.randn(1024, 1024, dtype=torch.float16, device=f"cuda:{rank}")
+
+# Perform distributed mixed precision GEMM with row sharding
+result = dist_gemm.distributed_gemm_fp16_fp32_nt(
+    a, b, 
+    strategy=dist_gemm.ShardingStrategy.ROW_PARALLEL
+)
+
+# Each process now has its portion of the result
+```
+
+### Sharding Strategies
+
+- **Row-Parallel** (`ShardingStrategy.ROW_PARALLEL`): Shards the first input matrix along rows, with each GPU processing a subset of rows. Best for matrices with large M dimension.
+- **Column-Parallel** (`ShardingStrategy.COLUMN_PARALLEL`): Shards the second input matrix along columns, with each GPU processing a subset of columns. Best for matrices with large N dimension.
+- **Fully-Sharded** (`ShardingStrategy.FULLY_SHARDED`): Shards both input matrices, with each GPU processing a portion of the output matrix. Best for extremely large matrices.
+
+### Running Distributed Benchmarks
+
+The library includes benchmarks to measure distributed GEMM performance:
+
+```bash
+# Run benchmark with 2 GPUs
+python benchmarks/benchmark_distributed.py --world-size 2
+```
+
+## New Features: Mixed Precision Support
+
+DeepGEMM also provides optimized mixed precision GEMM operations that leverage lower precision inputs with higher precision accumulation for improved performance while maintaining accuracy:
+
+- **FP16 to FP32 GEMM**: Performs matrix multiplication with FP16 inputs and FP32 accumulation
+- **BF16 to FP32 GEMM**: Performs matrix multiplication with BF16 inputs and FP32 accumulation
+
+These operations are particularly useful for deep learning inference and training, allowing for reduced memory usage and increased computational throughput without significant loss in accuracy.
+
+### Usage Example
+
+```python
+import torch
+import deep_gemm
+
+# Create input matrices
+a = torch.randn(1024, 1024, dtype=torch.float16, device='cuda')
+b = torch.randn(1024, 1024, dtype=torch.float16, device='cuda')
+
+# Perform mixed precision GEMM (FP16 inputs -> FP32 output)
+c = deep_gemm.gemm_fp16_fp32_nt(a, b)
+
+# Or use BF16 inputs
+a_bf16 = torch.randn(1024, 1024, dtype=torch.bfloat16, device='cuda')
+b_bf16 = torch.randn(1024, 1024, dtype=torch.bfloat16, device='cuda')
+c_bf16 = deep_gemm.gemm_bf16_fp32_nt(a_bf16, b_bf16)
+```
+
+### Performance
+
+The mixed precision operations provide significant speedup compared to standard precision operations, especially for large matrix sizes. Benchmark results comparing DeepGEMM's mixed precision implementations against PyTorch's native operations are available in the `benchmarks` directory.
+
+## Installation
+
+```bash
+# Clone the repository
+git clone <repository_url>
+cd DeepGEMM
+
+# Install dependencies using uv package manager
+uv venv .venv
+source .venv/bin/activate
+uv pip install -r requirements.txt
+
+# Install in development mode
+uv pip install -e .
+```
+
+## Running Tests and Benchmarks
+
+```bash
+# Run tests
+pytest tests/
+
+# Run mixed precision benchmarks
+python benchmarks/benchmark_mixed_precision.py
+
+# Run distributed benchmarks (requires multiple GPUs)
+python benchmarks/benchmark_distributed.py
+```
+
+## Original Features
+
+DeepGEMM still includes all original functionality:
+
+- FP8 to BF16 GEMM operations
+- Grouped GEMM operations
+- Optimized CUDA JIT kernels
 
 DeepGEMM is a library designed for clean and efficient FP8 General Matrix Multiplications (GEMMs) with fine-grained scaling, as proposed in [DeepSeek-V3](https://github.com/deepseek-ai/DeepSeek-V3). It supports both normal and Mix-of-Experts (MoE) grouped GEMMs. Written in CUDA, the library has no compilation need during installation, by compiling all kernels at runtime using a lightweight Just-In-Time (JIT) module.
 

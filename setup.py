@@ -69,15 +69,22 @@ if __name__ == '__main__':
 
     setuptools.setup(
         name='deep_gemm',
-        version='1.0.0' + revision,
-        packages=['deep_gemm', 'deep_gemm/jit', 'deep_gemm/jit_kernels'],
-        package_data={
-            'deep_gemm': [
-                'include/deep_gemm/*',
-                'include/cute/**/*',
-                'include/cutlass/**/*',
-            ]
-        },
+        version='0.2.0' + revision,
+        description='High-performance GEMM operations for deep learning',
+        author='DeepGEMM Team',
+        author_email='example@example.com',
+        url='https://github.com/example/DeepGEMM',
+        packages=setuptools.find_packages(),
+        classifiers=[
+            'Programming Language :: Python :: 3',
+            'License :: OSI Approved :: MIT License',
+            'Operating System :: OS Independent',
+        ],
+        python_requires='>=3.8',
+        install_requires=[
+            'torch>=2.0.0',
+            'numpy>=1.20.0',
+        ],
         cmdclass={
             'develop': PostDevelopCommand,
             'build_py': CustomBuildPy,

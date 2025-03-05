@@ -11,3 +11,9 @@ from .jit_kernels import (
     get_m_alignment_for_contiguous_layout
 )
 from .utils import bench, bench_kineto, calc_diff
+
+# Import mixed precision operations
+from .mixed_precision import (
+    gemm_fp16_fp32_nt,
+    gemm_bf16_fp32_nt
+)
